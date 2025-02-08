@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
@@ -7,93 +8,120 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// MySQL connection
-const con = mysql.createConnection({
-    host: "sql12.freesqldatabase.com",
-    port: 3306,
-    user: "sql12761740",
-    password: "rw3HwA9MBh",
-    database: "sql12761740"
+// Create a connection pool to fix connection error
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-con.connect((err) => {
+// Test the connection
+pool.getConnection((err, connection) => {
     if (err) {
-        console.error("Database connection failed: " + err.stack);
+        console.error("Database connection failed:", err.message);
         return;
     }
-    console.log("Connected to MySQL database!");
+    console.log("Successfully connected to MySQL database!");
+    connection.release(); // Always release the connection when done testing
 });
 
-// Email configuration
+// Convert pool to use promises
+const promisePool = pool.promise();
+
+// Email config
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: "avanishvadke001@gmail.com",
-        pass: "xxwhcorsucjfbhtt"  // Make sure this is an App Password from Google
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS 
     }
 });
 
-app.post('/subscribe', (req, res) => {
+// Add this new endpoint to your Express server
+app.post('/check-status', async (req, res) => {
     const { email } = req.body;
     
     if (!email) {
         return res.status(400).json({ message: "Email is required" });
     }
 
-    let checkSql = "SELECT * FROM subscribers WHERE email = ?";
+    try {
+        const [rows] = await promisePool.query(
+            "SELECT * FROM subscribers WHERE email = ?",
+            [email]
+        );
+        
+        return res.json({ isSubscribed: rows.length > 0 });
+    } catch (error) {
+        console.error("Error:", error);
+        return res.status(500).json({ error: "Database error" });
+    }
+});
 
-    con.query(checkSql, [email], (err, results) => {
-        if (err) {
-            console.log(err);
-            return res.status(500).json({ error: "Database error" });
-        }
+app.post('/subscribe', async (req, res) => {
+    const { email } = req.body;
+    
+    if (!email) {
+        return res.status(400).json({ message: "Email is required" });
+    }
 
-        if (results.length > 0) {
+    try {
+        // Check if email exists
+        const [existingUsers] = await promisePool.query(
+            "SELECT * FROM subscribers WHERE email = ?",
+            [email]
+        );
+
+        if (existingUsers.length > 0) {
             return res.status(400).json({ message: "Email is already subscribed!" });
-        } 
+        }
 
-        let insertSql = "INSERT INTO subscribers (email) VALUES (?)";
-        con.query(insertSql, [email], (err, result) => {
-            if (err) {
-                console.log(err);
-                return res.status(500).json({ error: "Database error" });
-            }
+        // Insert new subscriber
+        const [result] = await promisePool.query(
+            "INSERT INTO subscribers (email) VALUES (?)",
+            [email]
+        );
 
-            console.log("Inserted: ", result);
+        console.log("Inserted: ", result);
 
-            let mailOptions = {
-                from: "avanishvadke001@gmail.com",
-                to: email,
-                subject: 'Newsletter Subscription',
-                text: "You have successfully subscribed to our newsletter!\n\nYou will receive all the latest updates and offers from us."
-            };
+        // Send confirmation email
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Newsletter Subscription',
+            text: "You have successfully subscribed to our newsletter!\n\nYou will receive all the latest updates and offers from us."
+        };
 
-            transporter.sendMail(mailOptions, (err, info) => {
-                if (err) {
-                    console.log("Error occurred: ", err);
-                    return res.status(500).json({ error: "Failed to send email" });
-                }
-                console.log("Email sent: ", info.response);
-                return res.status(200).json({ message: "Subscription successful! Confirmation email sent." });
-            });
-        });
-    });
+        await transporter.sendMail(mailOptions);
+        console.log("Email sent successfully");
+        return res.status(200).json({ message: "Subscription successful! Confirmation email sent." });
+
+    } catch (error) {
+        console.error("Error:", error);
+        if (error.code === 'ECONNREFUSED') {
+            return res.status(500).json({ error: "Database connection failed" });
+        }
+        return res.status(500).json({ error: "An error occurred" });
+    }
 });
 
-app.delete('/unsubscribe', (req, res) => {
+app.delete('/unsubscribe', async (req, res) => {
     const { email } = req.body;
     
     if (!email) {
         return res.status(400).json({ message: "Email is required" });
     }
 
-    let sql = "DELETE FROM subscribers WHERE email = ?";
-
-    con.query(sql, [email], (err, result) => {
-        if (err) {
-            console.log(err);
-            return res.status(500).json({ error: "Database error" });
-        }
+    try {
+        const [result] = await promisePool.query(
+            "DELETE FROM subscribers WHERE email = ?",
+            [email]
+        );
 
         if (result.affectedRows === 0) {
             return res.status(400).json({ message: "Email not found in the subscription list!" });
@@ -101,22 +129,24 @@ app.delete('/unsubscribe', (req, res) => {
 
         console.log("Deleted: ", result);
 
-        let mailOptions = {
-            from: "avanishvadke001@gmail.com",
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
             to: email,
             subject: 'Newsletter Unsubscription',
             text: "You have successfully unsubscribed from our newsletter.\n\nIf you want to subscribe again, please visit our website."
         };
 
-        transporter.sendMail(mailOptions, (err, info) => {
-            if (err) {
-                console.log("Error occurred: ", err);
-                return res.status(500).json({ error: "Failed to send email" });
-            }
-            console.log("Email sent: ", info.response);
-            return res.status(200).json({ message: "Unsubscription successful! Confirmation email sent." });
-        });
-    });
+        await transporter.sendMail(mailOptions);
+        console.log("Email sent successfully");
+        return res.status(200).json({ message: "Unsubscription successful! Confirmation email sent." });
+
+    } catch (error) {
+        console.error("Error:", error);
+        if (error.code === 'ECONNREFUSED') {
+            return res.status(500).json({ error: "Database connection failed" });
+        }
+        return res.status(500).json({ error: "An error occurred" });
+    }
 });
 
 app.listen(9000, () => {
